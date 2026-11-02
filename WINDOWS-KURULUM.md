@@ -2,6 +2,8 @@
 
 Bu rehber TokenEconomizer içindir. Rues'un 14 ajanıyla birlikte kullanım için [ortak rehbere](https://github.com/aliorala/rues-orkestra/blob/main/KULLANIM.md) bakın; Rues deposu özeldir ve GitHub hesabınızın erişimi gerekir. Diğer Codex eklentilerini kurmaz. Aynı Codex hesabıyla başka PC'ye giriş yapmak yerel kurulumu otomatik taşımaz. Normal web ChatGPT sohbetlerine etkisi yoktur.
 
+Git, Python veya Codex CLI henüz yoksa [önkoşulları da kuran ortak komut bloğunu](https://github.com/aliorala/rues-orkestra/blob/main/KULLANIM.md) kullanın.
+
 ## Tek komutla başla
 
 Windows PowerShell 5.1+, Git, güncel Codex CLI/hesabı ve Python 3.10+ gerekir. PowerShell'i kaynak dosyalarını tutacağınız klasörde açın. `TokenEconomizer` klasörü henüz yoksa:
