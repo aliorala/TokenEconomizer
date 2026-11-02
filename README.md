@@ -1,3 +1,5 @@
+**Türkçe Windows rehberi: [tek komut kurulum, günlük kullanım ve güncelleme](WINDOWS-KURULUM.md)** · **[Rues + TokenEconomizer birlikte kullanım](https://github.com/aliorala/rues-orkestra/blob/main/KULLANIM.md)**
+
 # TokenEconomizer: Experience-Driven Black-Box Cost Control for Coding Agents
 
 <p align="center">
