@@ -1,12 +1,14 @@
 # TokenEconomizer plugin
 
 How to install and use TokenEconomizer in Claude Code, Codex, the GitHub Copilot CLI, Pi, Cursor
-(experimental), and opencode (experimental). What the plugin does and why is in the [main README](../README.md); its
+(experimental), Grok Build (experimental), opencode (experimental), Hermes Agent (experimental)
+and the Antigravity CLI (experimental). What the plugin does and why is in the [main README](../README.md); its
 design and the verified behaviour of each agent are in [`docs/PLUGIN.md`](../docs/PLUGIN.md).
 
 - [Before you start](#before-you-start)
 - Install and use it on [Claude Code](#claude-code) · [Codex](#codex) ·
-  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Cursor](#cursor)
+  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Cursor](#cursor) · [Grok Build](#grok-build) · [opencode](#opencode) ·
+  [Hermes Agent](#hermes-agent) · [Antigravity CLI](#antigravity-cli)
 - [What to expect](#what-to-expect) · [Commands](#commands) · [Settings](#settings)
 - [Repository map](#repository-map) · [Using with rtk](#using-with-rtk) ·
   [Model calls and API keys](#model-calls-and-api-keys) · [Troubleshooting](#troubleshooting)
@@ -322,12 +324,58 @@ events used by the adapter. The transcript format is private and its hooks do no
 token usage. TokenEconomizer records only the relevant hook events under its private state folder,
 uses them to learn repository facts and watch for loops, and reports Cursor session cost as
 unavailable. The loop guard's model calls use `cursor-agent` in read-only Ask mode; their token
-usage is also unavailable in the current CLI output. Cursor support is macOS and Linux only.
+usage is also unavailable in the current CLI output. Headless runs (`cursor-agent -p`, verified on
+2026.11.05) deliver no prompt or stop hook, so the adapter counts prompts from Cursor's own
+transcript and closes the turn when the run ends as completed. Cursor support is macOS and Linux only.
 On Windows, Cursor runs these hook commands through PowerShell, which cannot run the POSIX
 `te-hook` launcher.
 
 Tool pruning follows the global setting and is not applied to Cursor. Cursor commands run from a terminal:
 `~/.tokeneconomizer/bin/te --host cursor <command>`.
+
+## Grok Build
+
+Experimental; verified on grok 1.0.70. Grok runs Claude Code plugins and their hooks, so the plugin
+installs as the Claude Code one does:
+
+```sh
+git clone https://github.com/microsoft/TokenEconomizer.git
+grok plugin marketplace add "$PWD/TokenEconomizer"
+grok plugin install tokeneconomizer --trust
+```
+
+Without `--trust`, grok shows the source, warns that installing activates the plugin's hooks, and
+stops. Grok leaves plugins off until they are enabled: check `grok plugin list` (`grok plugin enable
+tokeneconomizer` if it is off), then start a new session. If TokenEconomizer is already installed for Claude Code, grok runs it from `~/.claude/plugins`
+too, and nothing more is needed. Either way the hook file passes no `--host`: the plugin tells grok
+from Claude Code by the fields only grok sends (`hookEventName`) and by its session folder
+(`~/.grok/sessions`), and a hook run from a Claude Code session is still Claude Code.
+
+**Check it.** From a terminal in the repository: `~/.tokeneconomizer/bin/te --host grok status`.
+Grok's tool shell and plugin slash commands were not checked, so run commands from a terminal.
+
+What grok does differently, and so what to expect:
+
+* **Micro-skills arrive with the first tool call.** Grok reads only a message for you from a
+  `SessionStart` hook, and discards a `UserPromptSubmit` hook's output; the one channel to the
+  model is a `PostToolUse` hook's `additionalContext`. The plugin saves the session's start context
+  (under `~/.tokeneconomizer/grok-start/`) and adds it to the first tool result, once. A session that
+  answers without a tool call never gets it. A resumed session is not given it again, as grok keeps
+  that note in the conversation.
+* **No tool pruning.** Micro-skills and the loop guard only.
+* **Stopping a stuck turn** is Ctrl+C; Esc does not cancel a turn in grok. Grok shows a hook's
+  message to you only from `SessionStart`, so the still-stuck line is also passed on by the model.
+* **Interrupted turns** (`StopCancelled`) are closed when your next prompt arrives, as on Claude
+  Code. At the end of a session grok fires one more, observe-only `Stop` (reason `shutdown`); the
+  plugin ignores it.
+* **Cost.** The session's tokens come from the `usage.json` grok keeps with the session; xAI models
+  are not in the price table, so they are priced on the labelled fallback curve.
+* **Model calls.** The proposer and the judge run through `grok -p --output-format json` in a
+  throwaway folder on your default model (`paid_model` names another), with the shell, edit, write,
+  web and subagent tools removed. Each such call leaves a session under `~/.grok/sessions/` that
+  the plugin does not track.
+
+**Uninstall.** `grok plugin uninstall tokeneconomizer`. Optional: `rm -rf ~/.tokeneconomizer`.
 
 ## opencode
 
@@ -353,10 +401,12 @@ where it is set. Settings made with `te config` need no restart.
 
 **How it hands a session over.** On 1.x the plugin exports the session with `opencode export` at
 the end of every turn and sends the path; on 2.x, which has no export command, it records the
-session from its events and writes the same JSON. A headless `opencode run` is folded when its
-turn ends and a deleted session when it is deleted. Quitting the TUI gives a plugin no chance to
-say so: that session is folded by the next session's start, once its export has been quiet for
-10 minutes.
+session from its events and writes the same JSON (where that copy holds no prompt, the fold reads
+2.x's `opencode session export` instead). A turn ends at 2.x's `session.execution.*` events or
+the documented `session.idle`, whichever the release emits; a headless `opencode run` is folded
+when its turn ends and a deleted session when it is deleted. Quitting the TUI gives a plugin no
+chance to say so: that session is folded by the next session's start, once its export has been
+quiet for 10 minutes.
 
 **Model calls.** The proposer and the loop guard's judge run through `opencode run` on your
 default opencode model (`paid_model` names another): tools that change anything are denied,
@@ -364,7 +414,8 @@ the session is deleted afterwards, and no other plugin runs (`--pure` on 1.x; `-
 2.x). On 2.x a reply that used no tool carries no usage, so its cost is estimated.
 
 **Verified live,** on opencode 1.19.5 and 2.2.0 (Python 3.12), with a scripted local model
-endpoint and, on 1.19.5, the free `opencode/big-pickle` model:
+endpoint and, on 1.19.5, the free `opencode/big-pickle` model; the 2.x entry is also exercised
+against 2.2.5 in CI:
 the plugin loads; sessions are folded with real usage and model; facts learned over five sessions
 reach the next session through the system prompt; the loop guard's judge ran, nudged a
 failing edit-and-test loop, and the redirect arrived in the model's next tool results; the
@@ -374,6 +425,164 @@ still-stuck notice was printed (`opencode run`) and the first notice shown as a 
 **Not covered:** the 2.x TUI, and notices on 2.x, which go to the server's stderr rather than a
 toast. A `read`, `task` or `*` permission denial stalls opencode 1.19.5 at start-up, which is why
 the side call denies only `bash`, `edit`, `webfetch` and `websearch`.
+
+## Hermes Agent
+
+Experimental, and narrower than the other agents: **micro-skills and the loop guard**, on Hermes's
+**classic CLI** (`hermes`, `hermes chat`) and **one-shot runs** (`hermes -z`, `hermes chat --oneshot`),
+with `terminal.backend: local`. Tested on 0.22.5 only.
+
+**1. Install.** Link the plugin directory, keeping it next to `scripts/` and `lib/`, enable it, and
+restart the gateway, which is what runs your sessions:
+
+```bash
+ln -s /path/to/TokenEconomizer/plugin/hermes ~/.hermes/plugins/tokeneconomizer
+hermes plugins enable tokeneconomizer
+hermes gateway restart
+```
+
+Do not use `hermes plugins install`: installing a subdirectory fetches only that folder, and its
+security scan refuses the whole repository (`experiments/` holds shell lines it rates critical,
+which `--force` does not override). A named
+profile has its own `plugins/` directory (`~/.hermes/profiles/<name>/plugins/`), which has not been
+tested. The plugin runs under the Python that runs Hermes; `TE_PYTHON` names another.
+
+**2. Check it.** Run a session, then `~/.tokeneconomizer/bin/te --host hermes status` in the
+repository (`doctor` says whether the link is in place). Commands run from a terminal. Micro-skills
+is off by default: `te --host hermes config set microskills=on` (or `envfacts`, without model calls).
+
+**Environment variables.** Hooks run in the gateway, not in the terminal you start `hermes` from,
+so a `TE_` variable you set there (`TE_DISABLE=1`, `TE_PYTHON`, ...) reaches the plugin only once
+the gateway restarts from a shell where it is set. Settings made with `te config` need no restart.
+
+**How it hands a session over.** When a session is folded, the plugin copies its rows from
+Hermes's `state.db`, read-only, to `~/.tokeneconomizer/hermes-sessions/<id>.json`, which is private
+to you and holds the tool calls and their results; a prompt is kept as a placeholder, and what the
+model replied is not kept. A one-shot run is folded when its turn ends. A session in the classic CLI
+is folded when Hermes finalizes it. One that never reaches an end (a killed terminal, a gateway that
+died in a turn) is folded by the next session's start in that repository, once its hooks have been
+quiet for 10 minutes. A session whose rows cannot be read then stays unfolded and is tried again at
+each later start in that repository, for a week after its last hook; after that it is recorded as
+unreadable.
+
+**Which repository.** Each session's own row names its directory, so sessions in different
+repositories can run at once in the one gateway. A session with no directory on this machine is
+not followed.
+
+**Model calls.** The proposer and the loop guard's judge run through `hermes chat --oneshot --source
+tool` on your default Hermes model (`paid_model` names another; `hermes_cli` or `TE_HERMES_CLI`
+names the `hermes` to run). The call offers the model no tool (`-t bot_room`, an empty toolset)
+and loads no rules or memory. It runs in your gateway, from a background job, and the plugin skips `tool` sessions, so
+sessions you run yourself with `--source tool` are not followed either. Hermes also generates a
+title for each call: what the call and its title spent is charged to the ledger, and then the
+session is deleted. One that cannot be read yet, after a timeout, is kept and settled by a later
+call, and one that still has no end 10 minutes after the timeout is charged for what it spent so
+far, so either can sit in `hermes sessions list --source tool` until the next call.
+
+**A redirect** arrives as a first key, `tokeneconomizer_redirect`, in the tool's JSON result, which
+stays valid JSON with every other byte as it was. Hermes marks `web_*`, `browser_*` and `mcp_*`
+results as untrusted data the model must not obey, so a redirect waits for the next other tool
+result in the turn, and is dropped if there is none.
+
+**Verified,** on 0.22.5 (Python 3.14) with an isolated `HERMES_HOME` and a scripted local model
+(`tests/test_hermes_plugin.py`; run it with `TE_HERMES_E2E=1 TE_HERMES_BIN=<hermes>`):
+`hermes plugins validate` passes, and a linked plugin enables and loads; facts reach the system
+prompt; two repositories' sessions ran at once and were folded and priced apart; in a failing
+one-shot turn the judge ran through a side call into the same gateway, the redirect arrived in a
+tool result, and the side call's sessions were charged and gone; a compression in a turn stayed
+one session.
+
+**Verified with a real model** (`upstage/solar-mini4:free`, a person's own Hermes): a classic CLI
+session that left with `/exit` and a run of `hermes -z` were folded and priced, the fold's token
+counts matching Hermes's; in five one-shot sessions `envfacts` learned that bare `pytest` fails in
+a repository where `python -m pytest` works, and the next session's first test command took the
+working form; a side call answered, its reply and title were charged, and its session was deleted;
+the judge ran on a real turn and spared it.
+
+Later, in forced failure loops with a seeded envelope and lowered thresholds: the judge called turns
+stuck at 0.80 and 0.90 and spared one at 0.62, a redirect it wrote and two from the backstop reached
+the agent in tool results, and the still-stuck notice fired twice. With `microskills=on`, the
+proposer ran after the 2nd and 5th sessions and recorded the working test command. A session cut
+off in mid-turn by a gateway that died, and two timed-out side calls, were recovered as described above.
+
+**Not covered:**
+
+* Whether a redirect changes a real model's course. In the loops above the agent was told to keep
+  repeating, or ran beside another session in one directory.
+* The still-stuck notice reaching a person: in both turns where it fired the model did not repeat it
+  while it worked, and both were cut off before a final reply. Killing `hermes -z` from outside
+  (SIGTERM) left its turn running in the gateway; whether the notice's Ctrl+C stops one is untested.
+* Facts in a real session's system prompt are seen in the plugin's log only: `state.db` held no
+  `system_prompt` for those sessions. A scripted run shows them in the request.
+* `/new`, Ctrl+D and a killed terminal. A compression that changes the session's id is tested
+  offline only; the ones seen kept the id.
+* A session resumed after it was folded: its later turns are neither learned from nor priced, since
+  a session folds once. That rule is shared by every agent. It matters more here, because a one-shot
+  run folds as soon as its turn ends, so `hermes -c` after `hermes -z` always lands on it.
+* The Ink TUI (`--tui`), Desktop, ACP, messaging platforms and cron are ignored, on purpose: nothing
+  has been verified there, and a chat is not repository work. So are subagents, whose tokens are
+  counted with their session and whose tool calls are not.
+* Remote terminal backends, named profiles and `plugins.isolation: host`.
+* Tool pruning. Hermes has no per-repository tool setting. `llm_request` middleware removed a tool
+  from a request in a probe, but keeping a session's list stable across its cache has not been built.
+* Notices. Nothing a hook can call was seen to reach the person (`post_message` returned ok and
+  printed nothing under `hermes -z`). The still-stuck line goes through the model, as on Claude Code;
+  other notices are logged, and returned when Hermes finalizes the session.
+* Edits made inside `execute_code` do not count as edits, and a call made by a subagent does not
+  reach the guard. Hermes has a repeated-failure warning of its own, which runs beside this one.
+
+A turn whose model runs its tests from a script it wrote does not count them as verification (a
+limit on every agent, [`docs/PLUGIN.md`](../docs/PLUGIN.md) §5), so a failed one can end "green". A
+judge call on a real turn cost about 14k effective tokens, far more than a short side call, because
+a turn's digest is what it reads.
+
+Micro-skills' block must fit Hermes's 4,000-character prompt section, which it does at the default
+`microskills_max_tokens`; a much larger one is dropped with a warning in Hermes's log. Hermes may also
+log a warning for the empty section of a session with no facts.
+
+**Uninstall.** `hermes plugins disable tokeneconomizer`, `rm ~/.hermes/plugins/tokeneconomizer`,
+`hermes gateway restart`. Optional: `rm -rf ~/.tokeneconomizer`.
+
+
+## Antigravity CLI
+
+Experimental: **micro-skills' LLM-free facts**, written against `agy` 1.5.1 on macOS and Linux
+(agy runs hook commands through `cmd /c` on Windows, and the launcher is a POSIX shell script).
+
+**1. Install.** Build the self-contained plugin, which copies the package into it, and install the
+directory:
+
+```bash
+python scripts/build_plugin.py --out dist/marketplace
+agy plugin install dist/marketplace/tokeneconomizer
+```
+
+`agy plugin validate dist/marketplace/tokeneconomizer` checks it. agy reads the plugin's hooks
+from `hooks.json` at the plugin root; the `hooks/hooks.json` beside it is Claude Code's, and agy's
+validator says it is never loaded.
+
+**2. Check it.** Run a session, then `~/.tokeneconomizer/bin/te --host antigravity status` in the
+repository. agy plugins load no slash commands, so every command runs from a terminal. Micro-skills
+is off by default: `te --host antigravity config set microskills=envfacts`.
+
+**How it works, and what it does not do.**
+
+- Three hooks are registered: `SessionStart` (injects the learned facts), `PreInvocation` (before
+  every model call: opens a turn at a new prompt and reads the tool results since the last call)
+  and `Stop`.
+- It never registers `PreToolUse`: a `PreToolUse` hook that prints `{}` makes agy deny the tool.
+  `PostToolUse` is unused: its payload holds no tool result, so the results are read from the
+  conversation's `transcript_full.jsonl` instead. A cursor into it is kept in
+  `~/.tokeneconomizer/antigravity-sessions/`, private to you.
+- agy has no `SessionEnd`: a conversation is folded by the next session start in that repository,
+  once its transcript has been quiet for 10 minutes.
+- Tool pruning is not available. Calls a subagent makes are not in the transcript and are not seen.
+  The transcript names no model, so session cost is priced on a labelled fallback, and older agy
+  versions leave token counts out of most of it.
+- The plugin makes no model call through `agy`: it has no option that runs a prompt with every
+  tool off, and such a call's prompt holds text a repository controls. So micro-skills' paid
+  proposer never runs, and the loop guard, which needs a judge's verdict to act, never redirects
+  a turn.
 
 ## What to expect
 
@@ -442,6 +651,7 @@ repository is not used by Codex there), while settings are shared by every agent
 | `config set KEY=VALUE … [--global]` | change settings for this repository (or every one); see [Settings](#settings) |
 | `config unset KEY … [--global]` | remove the setting at this level, so the global value (or the default) applies |
 | `repomap` / `repomap refresh` | the cached repository map / make it now (see [Repository map](#repository-map)) |
+| `history` / `history import [--dry-run]` | Claude Code: what the import of this repository's earlier sessions did / run it now, or say what it would read (see [Earlier sessions](#earlier-sessions)) |
 | `repos` | every repository it keeps state for: how it was identified, its sessions per agent, the checkouts seen |
 | `repos migrate` | file state an earlier version recorded under the repository it belongs to (runs by itself, once, after an upgrade) |
 | `repos merge KEY [INTO]` | merge one repository's state into another's (default: this one), for state whose checkouts are gone |
@@ -456,8 +666,11 @@ How to run them:
 | Copilot CLI | `/tokeneconomizer:<command>` (interactive mode) | `~/.tokeneconomizer/bin/te --host copilot <command>` |
 | Pi | `/te <command>` | `~/.tokeneconomizer/bin/te --host pi <command>` |
 | opencode | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host opencode <command>` |
+| Grok Build | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host grok <command>` |
+| Hermes Agent | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host hermes <command>` |
+| Antigravity CLI | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host antigravity <command>` |
 
-`doctor` and `repomap` run from a terminal (or as `/te …` on Pi); there is no slash command or
+`doctor`, `history` and `repomap` run from a terminal (or as `/te …` on Pi); there is no slash command or
 Codex skill for them.
 
 Inside an agent, each command is one model turn; from a terminal it costs nothing. Codex asks
@@ -517,7 +730,7 @@ and are shared by every agent working in it. The examples use Claude Code's form
 | `toolprune_min_sessions` | `2` | sessions those prompts must span; `1` lets a single session's prompts decide |
 | `toolprune_sessions` | `5` | or this many sessions, however few prompts they ran |
 | `toolprune_quiet_minutes` | `60` | how long the repository's sessions must have been idle before `auto` writes a deny list, so that no conversation resumed while its prompt cache is warm loses it (a list is written at the latest a day after it formed); `0` writes at once |
-| `toolprune_protect` | none | tools never left out however long they go unused, by name or pattern (`mcp__headroom__*`), separated by commas; a deny rule the plugin added for one is removed at the next fold, and rules you wrote are never touched |
+| `toolprune_protect` | none | tools never left out however long they go unused, by name or pattern (`mcp__headroom__*`), separated by commas (on Codex, capability packages: `collaboration`, `goals`, `image_media`); a deny rule the plugin added for one is removed at the next fold, and rules you wrote are never touched |
 | `loopguard_aggr` | `default` | the guard's threshold preset: `conservative`, `default` or `aggressive` |
 | `loopguard_nudges` | `1` | redirects per turn before the guard only tells you |
 | `loopguard.<name>` | from the preset | one guard threshold, set by hand (below) |
@@ -552,12 +765,39 @@ of the preset. A value you set with `loopguard.<name>` wins over both. Defaults 
 | `repomap_python` | auto | the Python that has aider installed |
 | `repomap_timeout` | `8` | seconds the first prompt may wait for a ranked map before the cached one is used |
 
+<a id="earlier-sessions"></a>**Earlier sessions** (Claude Code). Claude Code keeps every
+session's log (`~/.claude/projects/`, or under `CLAUDE_CONFIG_DIR`). With `history_import` on
+(it is off by default), the first session start in a repository where nothing has been folded
+yet reads that repository's earlier sessions from there, in a background `te history import`,
+oldest first and each once, without any model call; `history import` does the same by hand. A log
+belongs to the repository its recorded directory is in; when that directory no longer exists,
+to the repository whose root Claude Code would file under the same folder name (an exact match).
+Left out: a log written in the last ten minutes, one the plugin already saw, one with no prompt,
+one over 256 MB, one older than `history_days`, and a one-prompt `claude -p` or SDK run. A
+repository that already has folded sessions is not imported into (`history import` says why), so
+that earlier sessions are never learned after later ones; a session that ends during the import is
+folded after it. A deny list that rests on those earlier sessions is only proposed, even with
+`toolprune=auto`: the next session start says so, and nothing changes until you run `toolprune
+apply`. `status` counts the earlier sessions on their own. Since a repository's history is read
+only before its first session is folded, turn the import on right after installing
+(`config set history_import=on --global`), or run `history import` in a repository before its
+first session there ends.
+
+| Key | Default | What it sets |
+|---|---|---|
+| `history_import` | `false` | `true`: a repository's first session start reads its earlier sessions |
+| `history_max_sessions` | `200` | the most recent earlier sessions read |
+| `history_days` | `365` | how far back, in days |
+| `history_dirs` | none | further Claude Code `projects` folders to read, separated by commas |
+
 **Other settings:**
 
 | Key | Default | Values |
 |---|---|---|
 | `enabled` | `true` | `false`: the whole plugin is off; its hooks return at once and record nothing |
-| `paid_model` | `""` | model for the plugin's own calls; empty: `haiku` on Claude Code, the agent's own default model on Codex and Pi, on Copilot `COPILOT_PROVIDER_MODEL_ID` or `COPILOT_MODEL` (unless it is `auto`), else a BYOK provider's Haiku, else Copilot's own default |
+| `paid_model` | `""` | model for the plugin's own calls on every agent; empty: `haiku` on Claude Code, the agent's own default model on Codex and Pi, on Copilot `COPILOT_PROVIDER_MODEL_ID` or `COPILOT_MODEL` (unless it is `auto`), else a BYOK provider's Haiku, else Copilot's own default |
+| `<agent>_paid_model` | `""` | the same for one agent (`claude`, `codex`, `copilot`, `pi`, `opencode`, `cursor`, `grok`, `hermes`), over `paid_model` |
+| `claude_paid_effort`, `codex_paid_effort` | `""` | the reasoning effort of those calls: Claude Code `low` to `max`, Codex `none` to `max`; which values a model takes is the CLI's to say; empty: the CLI's default |
 | `pi_extensions` | `""` | Pi only: extension files (comma-separated paths) the plugin's own calls load, for a model whose provider an extension registers |
 | `pi_cli` | `""` | Pi only: the `pi` the plugin's own calls run; empty: the first on PATH |
 | `shadow` | `false` | decide and log everything, act on nothing |
@@ -634,6 +874,24 @@ a turn that shows signs of looping, and, when the judge finds the turn stuck, th
 writes. Tool pruning never calls a model. Turning micro-skills on adds its fact proposer, once
 every `microskills_propose_every` sessions (`microskills=envfacts` keeps only the facts found
 without a model call); `loopguard=off` turns the judge off along with the guard.
+
+What each call is sent, when it runs, and roughly how long its prompt is (about four characters to
+a token). No call is sent file contents or your prompts:
+
+| Call | When | What it reads | Prompt |
+|---|---|---|---|
+| Judge | in a turn that shows signs of looping, one call at a time, at most every 5 tool calls; after each "not stuck" answer the gap grows by 5 calls, up to 20 | the turn's last 24 actions (tool names, commands cut to 90 characters, edited file names, error signatures), its counts of edits, failing outputs and test runs, and how long this repository's turns usually are | at most about 1,500 tokens; the reply is a one-line verdict |
+| Redirect writer | right after the judge finds the turn stuck, at least `loopguard.judge_confidence` (0.7) sure | the judge's digest | at most about 1,500 tokens; the reply is 2 to 4 sentences |
+| Fact proposer | with `microskills=on` (or `distiller`), once every `microskills_propose_every` (3) sessions | digests of the last 8 sessions (for each: up to 12 command shapes, 6 checks and 6 failing commands with their error lines, all cut to 80 or 120 characters, and the edited files' names), and the facts already learned | a few thousand tokens, more when those sessions edited many files; the reply is a few facts and the patterns that test them |
+
+Each call is one request through the agent's CLI, which adds its own fixed instructions to the
+prompt; the plugin cannot leave those out, and the cost it records is the whole request's. The
+calls use the model `paid_model` names; when it is empty, `haiku` on Claude Code, and on the other
+agents the default listed under [Settings](#settings). `status` prints the repository's total as
+`plugin overhead`, with its share of all tokens. Per session, the repository's `ledger.jsonl`
+(under `~/.tokeneconomizer/repos/`) has the proposer's tokens in the session's record, under
+`overhead`, and a record of its own for each judge call (`"kind": "overhead"`, with the session's
+id).
 
 These calls run through **your own agent's CLI**: `claude -p`; `codex exec`; `copilot -p`, with
 every tool removed; and `pi -p`, with nothing loaded but the model. So they use whatever your

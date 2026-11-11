@@ -46,9 +46,23 @@ person can tune by hand:
   * loopguard.<name>            -- one guard threshold, pinned over the preset and over what the
                                    repository's history learned (LOOPGUARD_KEYS);
   * repomap, repomap_tokens, repomap_python, repomap_timeout -- the opt-in repository map;
+  * <agent>_paid_model          -- the model of the plugin's own calls on that agent, over
+                                   `paid_model` (claude, codex, copilot, pi, opencode, cursor,
+                                   grok, hermes);
+  * claude_paid_effort, codex_paid_effort -- their reasoning effort on those two agents;
   * pi_extensions, pi_cli       -- on Pi, the extensions the plugin's own model calls load (a
                                    custom provider's, whose model they could not reach otherwise;
-                                   comma-separated paths), and the `pi` they run.
+                                   comma-separated paths), and the `pi` they run;
+  * hermes_cli                  -- on Hermes, the `hermes` the plugin's own model calls run;
+  * history_import              -- on Claude Code, fold a repository's sessions from before the
+                                   plugin (Claude Code's own logs) once, at its first session
+                                   start, when nothing is folded there yet. Off by default:
+                                   the plugin learns only from sessions it sees end, and
+                                   `te history import` reads them by hand;
+  * history_max_sessions, history_days -- the newest sessions that import takes, and how far
+                                   back it reads;
+  * history_dirs                -- further Claude Code `projects` folders to read, beside
+                                   `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`).
 
 The names before the mechanisms were renamed are read too, so an existing config file keeps
 working: `inject` (microskills), `untool` (toolprune), `spiral` (loopguard), with their
@@ -164,15 +178,35 @@ class LiveConfig:
     repomap_python: str = ""
     repomap_timeout: int = 8
     paid_model: str = ""
+    claude_paid_model: str = ""
+    codex_paid_model: str = ""
+    copilot_paid_model: str = ""
+    pi_paid_model: str = ""
+    opencode_paid_model: str = ""
+    cursor_paid_model: str = ""
+    grok_paid_model: str = ""
+    hermes_paid_model: str = ""
+    claude_paid_effort: str = ""
+    codex_paid_effort: str = ""
     pi_extensions: list = field(default_factory=list)
     pi_cli: str = ""
+    hermes_cli: str = ""
+    history_import: bool = False
+    history_max_sessions: int = 200
+    history_days: int = 365
+    history_dirs: list = field(default_factory=list)
     shadow: bool = False
     vocabulary: str = "auto"
     warnings: list = field(default_factory=list)
 
     _CHOICES = {"mode": MODES, "microskills": MICROSKILLS, "toolprune": TOOLPRUNE,
                 "loopguard": LOOPGUARD, "repomap": REPOMAP, "loopguard_aggr": AGGR,
-                "vocabulary": ("auto", "generic", "python-git", "node-web")}
+                "vocabulary": ("auto", "generic", "python-git", "node-web"),
+                # Each CLI's own words (Claude Code 2.1.319, Codex 0.167.0); whether a model
+                # takes one is the CLI's to say.
+                "claude_paid_effort": ("", "low", "medium", "high", "xhigh", "max"),
+                "codex_paid_effort": ("", "none", "minimal", "low", "medium", "high", "xhigh",
+                                      "max")}
     # The smallest value a number setting takes, where it is not 1.
     _MIN = {"toolprune_quiet_minutes": 0}
 
@@ -215,6 +249,10 @@ class LiveConfig:
                 v = value if isinstance(value, bool) else str(value).strip().lower() in (
                     "1", "true", "yes", "on")
             elif isinstance(cur, int):
+                if isinstance(value, bool):
+                    raise ValueError("not a number")
+                if isinstance(value, float) and not value.is_integer():
+                    raise ValueError("must be a whole number")
                 v = int(value)
                 lo = self._MIN.get(key, 1)
                 if v < lo:
@@ -261,6 +299,9 @@ class LiveConfig:
 # Environment variables, old names first so that a new name set alongside its old one wins.
 _ENV = {"TE_MODE": "mode", "TE_SHADOW": "shadow",
         "TE_PAID_MODEL": "paid_model", "TE_VOCABULARY": "vocabulary",
+        **{f"TE_{a.upper()}_PAID_MODEL": f"{a}_paid_model" for a in (
+            "claude", "codex", "copilot", "pi", "opencode", "cursor", "grok", "hermes")},
+        "TE_CLAUDE_PAID_EFFORT": "claude_paid_effort", "TE_CODEX_PAID_EFFORT": "codex_paid_effort",
         "TE_INJECT": "microskills", "TE_INJECT_MAX_FACTS": "microskills_max_facts",
         "TE_INJECT_MAX_TOKENS": "microskills_max_tokens",
         "TE_PROPOSE_EVERY": "microskills_propose_every",
@@ -279,7 +320,10 @@ _ENV = {"TE_MODE": "mode", "TE_SHADOW": "shadow",
         "TE_LOOPGUARD_NUDGES": "loopguard_nudges",
         "TE_REPOMAP": "repomap", "TE_REPOMAP_TOKENS": "repomap_tokens",
         "TE_REPOMAP_PYTHON": "repomap_python", "TE_REPOMAP_TIMEOUT": "repomap_timeout",
-        "TE_PI_EXTENSIONS": "pi_extensions", "TE_PI_CLI": "pi_cli"}
+        "TE_PI_EXTENSIONS": "pi_extensions", "TE_PI_CLI": "pi_cli",
+        "TE_HERMES_CLI": "hermes_cli",
+        "TE_HISTORY_IMPORT": "history_import", "TE_HISTORY_MAX_SESSIONS": "history_max_sessions",
+        "TE_HISTORY_DAYS": "history_days", "TE_HISTORY_DIRS": "history_dirs"}
 _ENV_THRESHOLDS = ("TE_SPIRAL_THRESHOLDS", "TE_LOOPGUARD_THRESHOLDS")
 
 

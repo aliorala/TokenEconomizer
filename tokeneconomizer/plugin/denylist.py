@@ -400,10 +400,11 @@ def codex_config_error(repo_root, cli="codex", timeout=30):
     `codex features list` loads the whole layered configuration and calls no model, so a file
     that would break the person's next session fails here first. Silent (None) when the CLI is
     not installed, or the project is untrusted and its file is not loaded at all."""
+    from .sidecall import program
     if not shutil.which(cli):
         return None
     try:
-        out = subprocess.run([cli, "features", "list"], capture_output=True,
+        out = subprocess.run([*program(cli), "features", "list"], capture_output=True,
                              encoding="utf-8", errors="replace", cwd=repo_root, timeout=timeout,
                              env=dict(os.environ, TE_SIDECALL="1"))
     except (OSError, subprocess.SubprocessError):
@@ -428,9 +429,12 @@ def _apply_codex(repo_root, capabilities, store):
     for cap in capabilities:
         if cap not in CODEX_TOGGLES or cap in applied(store, path):
             continue
+        changed = False
         for table, key, value in CODEX_TOGGLES[cap]:
-            text, _ = _toml_insert(text, table, key, value, f"{MARK}:{cap}")
-        added.append(cap)
+            text, did = _toml_insert(text, table, key, value, f"{MARK}:{cap}")
+            changed = changed or did
+        if changed:
+            added.append(cap)
     if not added:
         return []
     if not _toml_valid(text):
@@ -484,9 +488,9 @@ def copilot_folder_trusted(path, env=None):
     folders = copilot_trusted_folders(env)
     if folders is None:
         return None
-    real = os.path.realpath(path)
+    real = os.path.normcase(os.path.realpath(path))
     for f in folders:
-        f = os.path.realpath(f)
+        f = os.path.normcase(os.path.realpath(f))
         if real == f or real.startswith(f.rstrip(os.sep) + os.sep):
             return True
     return False

@@ -13,7 +13,8 @@ import shlex
 
 from .state import basename
 
-_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+# `<<<` is a here-string: its word is the input itself, so no body follows on the next lines.
+_HEREDOC_START = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 _OPS = {"&&", "||", ";", ";;", "|", "|&", "&", "\n", "(", ")"}
 _OUT = {">", ">>", ">|", "&>", "&>>"}                  # redirects that write their operand
 _SKIP_OPERAND = {"<", "<<", "<<<", "<&", ">&", "<>"}   # input, heredoc tags, fd duplication
@@ -106,7 +107,9 @@ def _commands(shell):
 
 
 def _inplace_files(tokens, inplace_flag, script_flag):
-    """File operands of an in-place editor (`sed -i`, `perl -pi`), or [] if not in place."""
+    """File operands of an in-place editor (`sed -i`, `perl -pi`), or [] if not in place.
+    `script_flag(t)` says where an option puts the script: "next" for the following word
+    (`-e`, `--file`), "inline" for the option itself (`-e's/a/b/'`, `--expression=...`)."""
     if not any(inplace_flag(t) for t in tokens[1:]):
         return []
     files, have_script, skip = [], False, False
@@ -115,14 +118,42 @@ def _inplace_files(tokens, inplace_flag, script_flag):
             skip, have_script = False, True
             continue
         if not t or t.startswith("-"):
-            if t and script_flag(t):
+            where = script_flag(t) if t else None
+            if where == "next":
                 skip = True                     # the next token is the script
+            elif where == "inline":
+                have_script = True
             continue
         if not have_script:
             have_script = True                  # the first operand is the script
             continue
         files.append(t)
     return files
+
+
+def _short_script_flag(t, script_letters, stop_letters):
+    """Where a short-option cluster such as `-ne`, `-pe's/a/b/'` or `-i.bak` puts the script.
+    A letter in `stop_letters` takes the rest of the word as its own value (`-i.bak`)."""
+    if t.startswith("--") or len(t) < 2:
+        return None
+    for k, c in enumerate(t[1:], start=2):
+        if c in stop_letters:
+            return None
+        if c in script_letters:
+            return "inline" if t[k:] else "next"
+    return None
+
+
+def _sed_script_flag(t):
+    if t in ("--expression", "--file"):
+        return "next"
+    if t.startswith(("--expression=", "--file=")):
+        return "inline"
+    return _short_script_flag(t, "ef", "i")
+
+
+def _perl_script_flag(t):
+    return _short_script_flag(t, "eE", "iIMmxdDC")   # `-i.bak`, `-Mmod`, `-Idir` ...
 
 
 def _py_writes(text):
@@ -146,6 +177,41 @@ def _py_writes(text):
     return out
 
 
+def _restored(tokens):
+    """The paths a `git checkout -- <path>` or `git restore <path>` puts back; [] for any other
+    command."""
+    if tokens[0].rsplit("/", 1)[-1] != "git" or len(tokens) < 3 or \
+            tokens[1] not in ("checkout", "restore"):
+        return []
+    rest = (tokens[tokens.index("--") + 1:] if "--" in tokens
+            else tokens[2:] if tokens[1] == "restore" else [])
+    return [t for t in rest if not t.startswith("-")]
+
+
+def _bare(cmds):
+    """Each command with the `sudo`, `env`, `VAR=1` ... before it dropped; empty ones left out."""
+    out = []
+    for tokens in cmds:
+        while tokens and (tokens[0] in ("sudo", "command", "env", "time", "nohup")
+                          or re.match(r"^\w+=", tokens[0])):
+            tokens = tokens[1:]
+        if tokens:
+            out.append(tokens)
+    return out
+
+
+def shell_revert_targets(cmd):
+    """Basenames of the files a shell command puts back with `git checkout --` or `git
+    restore`: `shell_edit_targets` counts them as written, which they are; the loop guard counts
+    them as edits only for a file the turn edited."""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return []
+    shell, _ = _split_heredocs(cmd)
+    cmds, _ = _commands(shell)
+    names = [basename(p) for tokens in _bare(cmds) for p in _restored(tokens) if _not_scratch(p)]
+    return list(dict.fromkeys(n for n in names if n))
+
+
 def shell_edit_targets(cmd):
     """Basenames of the files a shell command writes, in order, without repeats."""
     if not isinstance(cmd, str) or not cmd.strip():
@@ -153,30 +219,23 @@ def shell_edit_targets(cmd):
     shell, bodies = _split_heredocs(cmd)
     cmds, writes = _commands(shell)
     found = [w for w in writes if _SOURCE_FILE.search(w)]
-    for tokens in cmds:
-        while tokens and (tokens[0] in ("sudo", "command", "env", "time", "nohup")
-                          or re.match(r"^\w+=", tokens[0])):
-            tokens = tokens[1:]
-        if not tokens:
-            continue
+    for tokens in _bare(cmds):
         head = tokens[0].rsplit("/", 1)[-1]
         if head == "sed":
             found += _inplace_files(
                 tokens, lambda t: bool(re.match(r"^(?:-[a-zA-Z]*i|--in-place)", t)),
-                lambda t: t in ("-e", "-f", "--expression", "--file"))
+                _sed_script_flag)
         elif head == "perl":
             found += _inplace_files(tokens, lambda t: bool(re.match(r"^-[a-zA-Z]*i", t)),
-                                    lambda t: bool(re.match(r"^-[a-zA-Z]*e$", t)))
+                                    _perl_script_flag)
         elif head == "tee":
             found += [t for t in tokens[1:] if not t.startswith("-") and _SOURCE_FILE.search(t)]
         elif head == "apply_patch":
             found += _PATCH_FILE.findall("\n".join(bodies + [" ".join(tokens[1:])])) or ["(patch)"]
         elif head == "patch" or (head == "git" and len(tokens) > 1 and tokens[1] == "apply"):
             found.append("(patch)")
-        elif head == "git" and len(tokens) > 2 and tokens[1] in ("checkout", "restore"):
-            rest = (tokens[tokens.index("--") + 1:] if "--" in tokens
-                    else tokens[2:] if tokens[1] == "restore" else [])
-            found += [t for t in rest if not t.startswith("-")]
+        else:
+            found += _restored(tokens)
     if _PYTHON.search(shell):
         found += _py_writes("\n".join([shell] + bodies))
     names = [p if p.startswith("(") else basename(p)

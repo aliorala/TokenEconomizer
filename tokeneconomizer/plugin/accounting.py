@@ -20,6 +20,9 @@ def effective(usage):
         return None, "no_usage"
     rec = {k: usage.get(k) for k in ("input_tokens", "cache_read_input_tokens",
                                      "cache_creation_input_tokens", "output_tokens", "model")}
+    # The 1-hour share of the cache writes, from a session reader's flat field or from an
+    # Anthropic `usage` object as a side call returns it.
+    rec["cache_creation_1h_input_tokens"] = pricing.cache_write_1h_tokens(usage)
     try:
         return pricing.effective_tokens(rec), "model"
     except ValueError:
@@ -31,7 +34,12 @@ def overhead_total(overhead):
 
 
 def summarize(records):
-    """Aggregate ledger records into the numbers `te status` prints."""
+    """Aggregate ledger records into the numbers `te status` prints.
+
+    A session imported from the agent's history (`imported: true`) ran before the plugin: it is
+    counted on its own (`imported_sessions`) and left out of every other number."""
+    imported = [r for r in records if r.get("kind") == "session" and r.get("imported")]
+    records = [r for r in records if not r.get("imported")]
     sessions = [r for r in records if r.get("kind") == "session"]
     priced = [r for r in sessions if isinstance(r.get("effective_tokens"), (int, float))]
     exec_total = sum(r["effective_tokens"] for r in priced)
@@ -41,6 +49,7 @@ def summarize(records):
                    if r.get("kind") in ("session", "overhead"))
     return {
         "sessions": len(sessions),
+        "imported_sessions": len(imported),
         "priced_sessions": len(priced),
         "effective_tokens": exec_total,
         "overhead_tokens": oh_total,

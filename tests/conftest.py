@@ -1,5 +1,6 @@
 """pytest fixtures shared across the offline suite."""
 import os
+import shutil
 import sys
 
 import pytest
@@ -9,6 +10,18 @@ _REPO = os.path.dirname(_TESTS)
 for p in (_REPO, _TESTS):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def git_sh():
+    """Git Bash's `sh`: on PATH, or beside the `git` that is. Git for Windows puts only
+    `<Git>\\cmd` on the PATH of PowerShell and cmd.exe; its `<Git>\\bin\\sh.exe` adds the
+    `usr\\bin` tools the launchers use (`tr`, ...), as the `bash.exe` Claude Code runs hooks with."""
+    found = shutil.which("sh")
+    git = shutil.which("git")
+    if found or not git:
+        return found
+    sh = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(git))), "bin", "sh.exe")
+    return sh if os.path.isfile(sh) else None
 
 
 def symlink_or_skip(src, dst):
@@ -25,6 +38,17 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_history(tmp_path_factory, monkeypatch):
+    """No test reads the person's own agent logs: a first session start imports what Claude
+    Code keeps under `~/.claude/projects` (`CLAUDE_CONFIG_DIR`). Both point at an empty
+    directory; a test that wants earlier sessions writes them there or names its own."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+
+
+@pytest.fixture(autouse=True)
 def _no_model_calls(request, monkeypatch):
     """No test reaches a real agent CLI. With the loop guard on, a stuck-looking turn wakes its
     judge: the plugin's side calls answer nothing here, and a judge job runs inline instead of
@@ -33,5 +57,6 @@ def _no_model_calls(request, monkeypatch):
     monkeypatch.setattr(judge, "spawn_job", judge.run_job)
     if request.node.get_closest_marker("real_sidecalls"):
         return
-    for name in ("claude_call", "codex_call", "copilot_call", "pi_call"):
+    for name in ("claude_call", "codex_call", "copilot_call", "grok_call", "hermes_call",
+                 "pi_call"):
         monkeypatch.setattr(sidecall, name, lambda *a, **k: ("", None))

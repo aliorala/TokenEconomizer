@@ -1,7 +1,7 @@
 # The plugin: design and verified agent behaviour
 
 How the plugin runs the three mechanisms inside your own Claude Code, Codex, Copilot CLI, Pi,
-opencode and Cursor sessions, through the hooks (on Pi, the extension events) each agent
+opencode, Cursor, Grok Build, Hermes Agent and Antigravity CLI sessions, through the hooks (on Pi, the extension events) each agent
 exposes: what it does at each hook, what differs from the experiments and why, the agent
 behaviour each choice rests on, where its state lives, and its known limitations. The code is `tokeneconomizer/plugin/` (what
 the hooks run) and `plugin/` (the packaging for each agent). To install and use it, see
@@ -13,7 +13,7 @@ the hooks run) and `plugin/` (the packaging for each agent). To install and use 
 
 | Hook | What the plugin does | Mechanism it drives |
 |---|---|---|
-| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen | microskills |
+| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; on Claude Code with `history_import` on, the first time in a repository with nothing folded, starts a detached `te history import` of its sessions from before the plugin, and says once when that is done | microskills |
 | `UserPromptSubmit` | Opens a prompt-turn for the loop guard | loopguard |
 | `PostToolUse` | Folds the call into the turn's guard; delivers a redirect as `additionalContext`, then, if the turn is still stuck, a one-line notice to the person (on Claude Code, also as context asking the model to repeat it); never stops the turn | loopguard |
 | `PostToolUseFailure` | The same, for a call that failed (Claude Code and Copilot report a failed call only here); the answer names this event, as Claude Code requires | loopguard |
@@ -44,8 +44,41 @@ re-tuned. Three things it adds:
   the hook. The hook starts the job and returns; a later PostToolUse picks up the verdict, with
   the redirect already written. Each job's spend is charged to the ledger when it is spent.
 
+**Earlier sessions** (`plugin/history.py`). Claude Code keeps every session's log, so the
+sessions a repository ran before the plugin was installed can be folded too: `te history
+import`, which the first session start in a repository runs by itself when `history_import` is
+on (it is off by default). Which
+logs are the repository's is decided as for a live session, by `repo_identity` of the directory
+each log records; where that directory is gone, by an exact match of the log's folder with the
+one Claude Code derives from the repository's root. A log written in the last ten minutes, one
+already folded or recorded by the plugin's hooks, one with no prompt, one over 256 MB, one older
+than `history_days`, and a one-prompt SDK run (`claude -p`) are left out, and the newest
+`history_max_sessions` are folded, oldest first. Folding treats each session as the newest so
+far, so the import keeps time order: it runs only into a store with nothing folded yet (otherwise
+`history.json` records the skip, and `te history import` refuses with the reason); it holds the
+repository's fold lock for its whole run, and while it runs or waits to resume, a session that
+ends stays unfolded and is folded after it; a run stopped by its 30-minute budget resumes the
+plan it saved, in order, and one whose heartbeat went stale is restarted by the next session
+start. A session whose fold fails, or that the import's process died on twice, is left out. An
+imported session is folded only to learn from: against the tools its own log shows
+(never today's catalog), with no model call, no deny rule held, written or given back, and a
+ledger record marked `imported` that `te status` and `te repos` count apart. Its turns are
+replayed through the loop guard with no envelope and no judge, and those that ended green seed
+the envelope. Under `toolprune=auto`, a later fold holds a deny list by itself only where the
+plugin's own sessions alone are enough evidence (`untool.json` counts them apart); the rest waits
+for `toolprune apply`, and the next session start says so.
+
 Every hook fails open: any error becomes an empty output (no change) and a traceback in
 `~/.tokeneconomizer/errors.log`. The hooks are stdlib only, and none waits on a model call.
+
+One session's hooks run one at a time (`plugin/hookqueue.py`): an agent that calls tools in
+parallel starts their hooks together, and each one rewrites the session document. A hook that gets
+no lock within a few seconds saves its event to the session's queue and answers nothing, and
+whoever holds the lock applies the queue. `SessionStart`, and `UserPromptSubmit` under
+`repomap=on`, answer with context, so they are not queued: they wait, and then run without the
+lock. A decision the guard reaches on a queued call has no answer to go in, so it waits on the turn
+and the turn's next call acts on it, a call late. A turn that ends first drops it (an `undelivered`
+event): no nudge is counted, and there is no one left to redirect.
 
 ## 2. What changes relative to the experimental setting
 
@@ -294,6 +327,38 @@ settings would be):
 * Not yet exercised: `pi install git:github.com/…` against GitHub itself, which needs the
   root manifest pushed.
 
+**opencode 1.19.5 and 2.2.0 — verified live, 2026-10-29** (scripted local model endpoint; on
+1.19.5 also the free `opencode/big-pickle`; the 2.x entry also runs against 2.2.5 in CI):
+
+* Like Pi, opencode has no hook protocol: `plugin/opencode/tokeneconomizer.ts` speaks the
+  dispatcher's on opencode's behalf. One file serves both generations — 1.x reads its `server`
+  entry, 2.x its `setup` — mapping opencode's events onto the same `te-hook --host opencode`
+  calls: on 1.x `session.created`, `chat.message`, `experimental.chat.system.transform`,
+  `tool.execute.after`, `session.idle` and `session.deleted`; on 2.x `ctx.session.hook("prompt",
+  …)` for prompt admission, `ctx.session.hook("context", …)` for the manual's system-prompt
+  injection, `ctx.tool.hook("execute.after", …)`, and the public event stream
+  (`ctx.event.subscribe()`). A 2.x release missing one hook still loads the rest.
+* End to end on both: the plugin loaded, sessions folded with real usage and model, facts
+  learned over five sessions reached the next session through the system prompt, the loop
+  guard's judge nudged a failing edit-and-test loop and the redirect arrived in the model's
+  next tool results; on 1.19.5 the still-stuck notice printed on `opencode run` and the first
+  notice showed as a TUI toast, and a session quit with Ctrl+D was folded by the next start.
+* Session logs: on 1.x the plugin exports the session with `opencode export` at every turn's
+  end. On 2.x (no `opencode export`) it records the session from the event stream itself; on
+  2.2.5 that copy came out empty for every session (#118), so an empty copy is never kept over
+  a fuller one and the fold retries with 2.x's own `opencode session export`, run in the
+  session's project directory (2026-11-02).
+* A turn's end on 2.x arrives as `session.execution.{succeeded,failed,interrupted}` or the
+  documented `session.idle`; either alone closes the turn once.
+* opencode 2.x runs plugins in its background service, which on Windows has no console: every
+  child the hooks start carries `windowsHide` (the per-hook console windows flickered while the
+  agent worked, fixed 2026-10-31), and a `TE_*` variable set in the terminal reaches the plugin
+  only after `opencode service restart`.
+* Model side calls run `opencode run` with `--pure` (1.x) or `--standalone` (2.x, so the shared
+  service's other plugins — this one included — cannot fire inside them) and `bash`, `edit`,
+  `webfetch`, `websearch` denied; a `read`, `task` or `*` denial stalls 1.19.5 at start-up. On
+  2.x a reply that used no tool carries no usage, so its cost is estimated.
+
 **End to end, as a new user, 2026-10-14** — on each agent a fresh home followed `README.md` and
 this plugin's guide step by step (Claude Code 2.1.300, Codex 0.153.1, Copilot CLI 1.0.83, Pi
 1.2.0; every model through OpenRouter; a small Python repository where `pytest` is missing and
@@ -499,8 +564,127 @@ reported. Replayed through the guard, the recorded SWE-bench sessions end well i
 turns on Claude Code (13,312 sessions), 84.5% on Copilot (6,710) and 87.8% on Codex (2,653), and
 the judge's gate opens in 18.1%, 15.8% and 5.8% of them.
 
+**What a successful Claude Code call exited with, 2026-11-04 (#128).** Claude Code gives a
+successful call no exit status and reports a non-zero exit only as a failure (`PostToolUseFailure`
+live, `is_error` in its log: of about 8,100 Bash results in one machine's logs, no success named
+an exit code). So every successful call was read by its output: a passing Playwright run that
+prints libuv's `Assertion failed` as it exits, or source read with `cat` that mentions an
+`Error`, counted as failing. A successful shell call now counts as exit 0 where that status
+covers the command: one command, an `&&` chain, or one whose earlier commands only read, move
+about, set up or report (`loopguard.turn.exit_status_covers`); `python repro.py | tail` is still
+read by its output. Two more: a file put back with `git checkout --` or `git restore` counts as
+an edit only when the turn edited it, and every test run the turn's tracker knows (Playwright,
+`npx vitest`, behind `dotenv … --`) counts among the redirect's verifications. Replayed through
+the guard, 3,806 recorded SWE-bench sessions on Claude Code had 7,730 failing outputs before and
+4,660 after; the judge's gate opened in 9.7% of them instead of 11.9%, 82 read as stuck instead
+of 113, and 91.6% ended well either way. Over 682 interactive turns the failing outputs went
+from 1,586 to 594 and the turns that opened the gate from 68 to 25.
+
 The plugin's proposer prompt lists each fact it holds with its claim, so a fact it has is not
 authored again under a new id; the experiments' prompt names the ids alone, as the paper ran it.
+
+**Hermes Agent 0.22.5 -- verified 2026-10-31**, from the installed source and from a copy of it
+run with an isolated `HERMES_HOME` against a scripted OpenAI-compatible endpoint, every request
+recorded. (`plugin/README.md` says what this covers, what was then run on a real model, and what
+was not.)
+
+* Every session runs in one gateway process, `hermes -z` and the classic CLI alike, started on
+  demand: plugins run there, never in the client. Its directory and environment are its own, so a
+  hook reads the session's `cwd` from its row in `state.db`: a user session's is where it started.
+* Hook order differs from the docs: `transform_tool_result` fires BEFORE `post_tool_call`, and it
+  is the one that can answer. The prompt section's callback runs before `on_session_start`. A
+  resumed session fires neither, and its section and earlier context reach the model unchanged.
+  `on_session_end` fires after every turn. `on_session_finalize` fired for `chat --oneshot`
+  (`reason: cli_close`), and, against the docs, not for `hermes -z`.
+* A subagent fires the whole set, on a session of its own (`created_source: subagent`).
+* A user's interactive row reads `source: local`, `created_source: cli`; a side call's reads
+  `tool`, with no `cwd`. The plugin follows `created_source` `cli` and `oneshot` with a `cwd`, and a
+  row it cannot read not at all, so the filter fails closed.
+* **Side calls.** `--source tokeneconomizer` is refused (`invalid_params`), though the docs say any
+  value is stored; `tool` is accepted. `TE_SIDECALL` does not reach the gateway, and worse: with no
+  gateway running a side call starts one, which kept `TE_SIDECALL=1` in its environment, and would
+  have run every later session with the plugin off. So the variable is removed from the call. A side
+  call completed while the turn it judged ran on, and also, as a test of deadlock, while a hook of
+  that turn waited for it. One that had to start the gateway took 33 s. `hermes -z` would auto-approve
+  dangerous commands, so it is not used.
+* **Usage.** `session_model_usage` holds a row per model and task. Six calls of 1,000 prompt tokens,
+  600 cached, are stored as `input_tokens` 2,400 and `cache_read_tokens` 3,600, and `--usage-file`
+  reports 6,000: it is not read. The title row was there when the client exited, and a delete takes
+  the usage rows with it, so a side call is charged first; a delete in flight left no orphan row.
+* **Timeouts.** One overrun of `plugins.hook_callback_timeout` (30 s) silences that callback for 60 s
+  for every session, so a dispatcher call has 20 s and the session lock 5 s. "Still running" is keyed
+  on `tool_call_id`: a stand-in that reused ids across sessions lost hooks; provider ids do not repeat.
+* **Redirects.** Text appended to a result makes it invalid JSON, and Hermes then reads a failed call
+  as `ok`. As a first key the status stays `error`, and a 50,690-character result kept the redirect at
+  its head. Results of `web_*`, `browser_*` and `mcp_*` are wrapped as untrusted after the hook runs.
+* **Sessions with no end.** A gateway that dies in a turn fires no hook, and a client killed from
+  outside (SIGTERM) left its turn running in the gateway for 20 minutes, so neither can be relied on
+  to end a session. The fold therefore reads `state.db` itself, from the Hermes home the session
+  ran under (a session's state keeps it, since `te fold` in a shell may be in another profile), and
+  a session's quiet time is taken from its own hooks. With no row and no copy to read, a fold leaves
+  the session pending for a week rather than marking it folded. A side call killed at its timeout
+  got no `ended_at` a day later.
+* **Compression** ran inside a turn (an auxiliary `compression` usage row) and kept the session's id;
+  the code also has a path that continues in a child, tested offline only.
+* **Install.** `hermes plugins install` scans what it fetched, and a source outside its catalog is
+  refused on a single critical finding, with no override but `plugins.scan_on_install: false`. This
+  repository gets 3 of 241, all in `experiments/`, the same from GitHub as from a local path; a
+  high finding (the `rm -rf ~/.tokeneconomizer` in `plugin/README.md`) is refused too, unless forced.
+  A tree of `tokeneconomizer/`, `plugin/hermes/` and `plugin/scripts/` with a `plugin.yaml` and a
+  loader at its root scanned clean, installed, and ran a session through a real gateway; Hermes lists
+  it once, so the manifest under `plugin/hermes/` is not a second plugin. `hermes plugins doctor`
+  runs no such scan: it passes on the repository.
+* **Tool pruning** is not offered. Config is per profile, project plugins are not loaded, and a
+  portable Agent Plugin carries no hooks. `llm_request` middleware did remove a tool from the wire
+  (20 to 19), and `sessions.tool_names` records each session's list, so it is a possible route.
+
+**Grok Build 1.0.70 -- verified 2026-11-05**, from its docs (`user-guide/10-hooks.md`, `09-plugins.md`,
+`14-headless-mode.md`) and from hook payloads and session files of live `grok -p` runs:
+
+* **It runs Claude Code plugins**, `~/.claude/plugins` included, and their hooks (`security-guidance`
+  and `explanatory-output-style` appeared in a session's hook log). So this plugin, installed for
+  Claude Code, already ran inside grok sessions with no `--host` and was read as Claude Code. Every
+  payload carries both spellings of each field (`hookEventName` = `post_tool_use` and
+  `hook_event_name` = `PostToolUse`, `sessionId` / `session_id`, `toolResult` / `tool_response`,
+  `transcriptPath` / `transcript_path`); `hookEventName`, which Claude Code never sends, and a
+  `transcript_path` under `/.grok/sessions/` identify it. The hook environment adds
+  `GROK_HOOK_EVENT` and `GROK_SESSION_ID`, which count only when the payload names no transcript
+  (they are inherited by a Claude Code started from a grok shell).
+* **Output channels, checked by injecting codewords and asking the model.** `SessionStart` reads
+  only a top-level `systemMessage`, shown to the person; its `additionalContext` never reached the
+  model. An allowing `UserPromptSubmit` hook's output is discarded. A `PostToolUse` (and
+  `PostToolUseFailure`) `hookSpecificOutput.additionalContext` reaches the model, in a system
+  reminder naming the hook, capped at 10,000 characters; it is stored in the session as a synthetic
+  user message, so a resumed session has it. `systemMessage` is documented as shown only from
+  `SessionStart`, so a notice on a tool event goes through the model too (`relays_notices`). The
+  plugin therefore sets the start context aside at `SessionStart` and delivers it with the first
+  tool result (`Grok.render`).
+* **Turns.** One `grok -p` run fires `SessionStart` (source `new`), `UserPromptSubmit`, `PostToolUse`
+  per call, `Stop` (reason `end_turn`), `SessionEnd`, then a second observe-only `Stop` (reason
+  `shutdown`, no `promptId`) that the plugin ignores. `promptId` is on `UserPromptSubmit` and `Stop`
+  only, so a turn stays open from the prompt to its `Stop`. `StopCancelled` (interrupt, declined
+  permission, `--max-turns`) and `StopFailure` (API error) are not in the Claude hook file, since
+  Claude Code's loader may reject event names it does not know (not checked); an interrupted turn
+  is closed by the next prompt. A non-zero shell exit is a normal `PostToolUse`.
+* **Tool results are tagged objects**: a shell result is `{type: "Bash", output: [byte values],
+  output_for_prompt: "exit: N\n...", exit_code, timed_out, ...}`, `ReadFile`, `GrepSearch`
+  (`exit_code` 1 for no match), `ListDir`, `SearchReplace` and `WebFetch` carry their text one level
+  down. Past 128 KiB the value is a plain string. Tool names are grok's own (`run_terminal_command`,
+  `read_file`, `search_replace`, `grep`, `list_dir`); `trace.grok_tool` maps them to the names the
+  mechanisms read.
+* **Session files.** `~/.grok/sessions/<url-encoded cwd>/<id>/updates.jsonl` is an ACP log
+  (`user_message_chunk`, `tool_call`, `tool_call_update`, `turn_completed`); `usage.json` beside it
+  holds the session's tokens. `inputTokens` includes the cached reads (40,650 = 10,442 fresh +
+  30,208 cached) and `outputTokens` the reasoning tokens; `grok -p --output-format json` reports
+  `input_tokens` without the cache.
+* **Hook commands.** The Claude hook file's `"${CLAUDE_PLUGIN_ROOT}/scripts/te-hook"` runs through
+  a shell (a double-quoted path holding `$`), with `CLAUDE_PLUGIN_ROOT` set as an alias of grok's
+  own; grok's default timeout for an observe hook is 5 s, so `SessionStart`'s explicit 15 s matters.
+* **Not exercised.** Plugin slash commands under grok, `grok plugin install` from this repository
+  (the docs show `grok plugin install <name> --trust` for a marketplace plugin, and plugins off until
+  enabled), and `--resume` delivery of the start context.
+* **Side call, verified on 1.0.70.** With the side call's flags, the run's recorded tool list held
+  only `read_file`, and a prompt asking it to create a file left none.
 
 ## 4. State and privacy
 
@@ -519,6 +703,10 @@ Which repository a session belongs to (`plugin/paths.py`, `plugin/repos.py`):
   `gitdir:` file naming one that exists -- and the walk up from a session's directory stops at
   the home directory, so a versioned (or stray, empty) `~/.git` is the repository of sessions
   started in `~` and of nothing below it. `GIT_CEILING_DIRECTORIES` is honoured as git does.
+  `$TOKENECONOMIZER_REPO`, when set, is the repository's remote URL where git names none: a
+  session in a directory without git metadata (an export of a checkout in a container, a new
+  folder per run), or in a checkout without an `origin`, is keyed as a clone of that remote and
+  shares what was learned there. A checkout's own `origin` wins.
 * **One repository per session.** A hook's `cwd` is where the agent is now (Claude Code's
   follows its `cd`), so the first hook of a session pins it (`sessions/<host>/<id>.json`) and
   every later hook, and the fold it hands off, uses the repository it started in -- where the
@@ -540,17 +728,31 @@ Which repository a session belongs to (`plugin/paths.py`, `plugin/repos.py`):
   `merged/`, displaced learned state to `premerge-*`. `te repos merge KEY [INTO]` joins two by
   hand, for state whose checkouts are gone.
 
+Besides the logs of the sessions whose hooks it sees, the plugin reads Claude Code's own logs
+once per repository, for the import of its earlier sessions (with `history_import` on, or `te
+history import`; off by default):
+the head of each log under `~/.claude/projects/` (or `CLAUDE_CONFIG_DIR`, and `history_dirs`), to
+tell which are the repository's, and those in full.
+
 The state directory, like the agents' own session logs it is derived from, is private to you:
 the plugin creates it `0700` and its files `0600`, and tightens a looser one it finds.
+
+The plugin reads most agents' session logs where they are. Hermes's and opencode's have to be
+exported beside the state: opencode's export is the conversation as it stands; Hermes's holds the
+columns the fold reads, tool calls and results among them, with each prompt a placeholder and the
+model's replies left out, so a prompt's words stay in Hermes's own database. A tool's arguments and
+results are kept, and can repeat what a person wrote.
 
 Nothing leaves the machine but the model calls of the loop guard (its judge and nudge writer, on
 by default with the guard), of micro-skills (its proposer, when it is on), and, only when you run
 it, of `toolprune measure` on Claude Code. Those calls send
 **digests** — command templates, edited file basenames, error lines with paths and numbers
 masked, never file contents — through your own agent CLI (`claude -p` / `codex exec` /
-`copilot -p` / `pi -p`), billed where your session is. The proposer keeps the digests of the last eight
+`copilot -p` / `pi -p` / `opencode run` / `grok -p` / `hermes chat`), billed where your session is. The proposer keeps the digests of the last eight
 sessions with its state, raw commands and output capped, so that each run sees more than the
-session that just ended.
+session that just ended. Sessions imported from Claude Code's history call no model, but their
+digests join that window, so the proposer's next call can include digests of sessions from
+before the plugin.
 
 The deny-list writer adds and removes only deny rules it recorded adding, never one you wrote, and
 adds a `settings.local.json` it creates to `.git/info/exclude`. A repository decides what its
@@ -576,12 +778,50 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
   redirect but the backstop's, which still counts.
 * **Pi** — tool pruning is not planned there, since Pi declares only four tools by default.
 * **Cursor Agent (experimental)** — hook event mapping follows Cursor's published hook schemas.
-  Cursor 3.24.9 loaded the local plugin, but hook delivery from a live Agent session has not been
-  verified. Cursor's transcript format is undocumented, and its hook payloads do not expose
-  session token usage. The adapter records prompt and tool events for learning and loop detection;
+  Cursor 3.24.9 loaded the local plugin. Verified on `cursor-agent` 2026.11.05 (macOS) with
+  `cursor-agent --trust -p`: `sessionStart`, `postToolUse`, `afterShellExecution` and `sessionEnd`
+  are delivered; `beforeSubmitPrompt` and `stop` are not (registered, never fired), and
+  `postToolUseFailure` was not exercised. An `additional_context` reply to both `sessionStart` and
+  `postToolUse` reaches the model. `transcript_path` is null on `sessionStart` and the first
+  `postToolUse`, then Cursor's own log. Without `beforeSubmitPrompt` the first tool call opens the
+  turn, the prompt count is read from the user rows of Cursor's own transcript, and a `sessionEnd`
+  reporting `completed` closes the open turn as normal. The interactive TUI has not been tested.
+  Cursor's transcript format is undocumented, and its hook payloads do not expose
+  session token usage (the `-p` JSON result has it; hooks never see it). The adapter records prompt and tool events for learning and loop detection;
   session and side-call costs are reported as unavailable. Tool pruning is not implemented for
   Cursor. macOS and Linux only: Windows Cursor runs hooks through PowerShell, and the launcher
   is a POSIX shell script.
+* **opencode (experimental)** — verified on 1.19.5, 2.2.0 and 2.2.5 (CI), not in the 2.x
+  terminal UI. On 2.x the loop guard's notices go to the server's stderr because plugins cannot
+  toast there; opencode has no deny-list settings file, so tool pruning does not apply (as on
+  Pi), and a TUI quit is only noticed by the next session's start.
+* **Grok Build (experimental)** — micro-skills and the loop guard, on 1.0.70. No tool pruning. The
+  start context reaches the model only with the session's first tool call (a session with none
+  never gets it), and the ledger counts it as injected from `SessionStart`. A turn interrupted
+  with Ctrl+C is closed by the next prompt, not by an event. Side calls leave a session under
+  `~/.grok/sessions/`; xAI models are priced on the fallback curve.
+* **Hermes Agent** — experimental: micro-skills and the loop guard, on the classic CLI and one-shot
+  runs, verified with a scripted model and one free real model. Its limits are listed in
+  `plugin/README.md`.
+* **Antigravity CLI (`agy`, experimental)** — micro-skills' LLM-free facts, written against
+  agy 1.5.1 and its own installed hook documentation; tool pruning is not implemented. The
+  plugin makes no model call through `agy`, which has no option that runs a prompt with every tool
+  off (`sidecall.NO_SIDE_CALLS`), so the paid proposer and the loop guard's judge never run. What
+  was captured live: hooks come from a `hooks.json` at the plugin root, run through `sh -c` in
+  that directory, with camelCase payloads that name no event (the hook file's command does,
+  `--event`) and leave out a zero (`invocationNum` 0, the first model call of a prompt). A
+  `PreToolUse` hook that prints `{}` makes agy deny the tool, so none is registered;
+  `PostToolUse` carries no tool result and a matcher `"*"` never matches, so the results are read
+  from the conversation's `transcript_full.jsonl` at the next `PreInvocation` and at `Stop`, where
+  every result of the previous model call is already written (`trace/antigravity.py`). There is no
+  prompt event and no `SessionEnd`: a prompt is the `PreInvocation` with `invocationNum` 0, and a
+  conversation is folded by the next session start in its repository once its transcript has been
+  quiet for ten minutes. Context goes back as `injectSteps`: a persistent `systemMessage` at
+  `SessionStart`, an `ephemeralMessage` (dropped after the turn) at `PreInvocation`. Calls a subagent
+  makes are not in the transcript and are not seen. Transcript token fields are absent from older
+  agy versions (unknown, not zero), and the transcript names no model, so session cost is priced
+  on the ledger's labelled fallback. macOS and Linux only: agy runs hook commands through
+  `cmd /c` on Windows, and the launcher is a POSIX shell script.
 * **Known gaps:**
   * `codex exec` prints no hook messages, so a headless Codex run shows no notice; `te status`
     counts it afterwards. On Claude Code the notice reaches the conversation and `claude -p`'s
@@ -589,8 +829,6 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
     the detailed transcript (Ctrl+O) always has it.
   * A turn that ran no recognised verification counts as ended green, so a failed turn without
     one can enter the envelope and loosen the guard for every later turn.
-  * The free fact layer has no family for "this tool is absent here, with no working
-    alternative" (a missing `ruff`, `mypy` or `pre-commit`, say).
   * Test runs launched from a script are not recognised as verification.
   * `refresh-catalog` is manual, once per machine and agent; until it runs, evidence pruning
     sees only the tools sessions used (plus, on Claude Code, the deferred ones). Running it at
